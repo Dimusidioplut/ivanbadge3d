@@ -1,11 +1,12 @@
 import * as THREE from 'three'
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { Canvas, extend, useThree, useFrame } from '@react-three/fiber'
-import { useAnimations, useGLTF, useTexture, Environment, Lightformer } from '@react-three/drei'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { Canvas, createPortal, extend, useThree, useFrame } from '@react-three/fiber'
+import { useAnimations, useGLTF, useTexture, Environment, Lightformer, Outlines } from '@react-three/drei'
 import { BallCollider, CuboidCollider, Physics, RigidBody, useRopeJoint, useSphericalJoint } from '@react-three/rapier'
-import { Bloom, EffectComposer } from '@react-three/postprocessing'
+import { Bloom, BrightnessContrast, ColorDepth, DotScreen, EffectComposer, HueSaturation } from '@react-three/postprocessing'
 import { MeshLineGeometry, MeshLineMaterial } from 'meshline'
-import { useControls } from 'leva'
+import { folder, Leva, useControls } from 'leva'
+import { applyToonMaterials, getInitialPreset, MATERIAL_MODES, TOON_PRESETS } from './toon'
 extend({ MeshLineGeometry, MeshLineMaterial })
 const MODEL_SCALE = 2.25
 const ATTACH_INSET = 0.06 // на сколько утопить кончик ленты внутрь корпуса
@@ -114,6 +115,27 @@ function addBrushedMetalShader(root) {
   return root
 }
 
+// Настройки верёвки: вынесены в панель «Верёвка». Параметры, помеченные (*),
+// пересоздают физику при изменении (Rapier не умеет менять длину/массу на лету).
+const ROPE_DEFAULTS = {
+  segmentLength: 1,
+  anchorHeight: 4,
+  gravity: 40,
+  timeStep: 120,
+  linearDamping: 2.5,
+  angularDamping: 3,
+  cardDensity: 1,
+  maxStretch: 1,
+  maxLinVel: 18,
+  maxAngVel: 12,
+  throwPower: 0.35,
+  dragSmoothing: 30,
+  tiltBack: 0.25,
+  visualMinSpeed: 10,
+  visualMaxSpeed: 50,
+  bandWidth: 1
+}
+
 export default function App() {
   const modelUrl = useLatestModelUrl()
   const physics = useControls('Физика', {
@@ -121,6 +143,28 @@ export default function App() {
     staticPreview: { value: false, label: 'Статичный предпросмотр' },
     maxDragRotation: { value: 90, min: 1, max: 90, step: 1, label: 'Макс. поворот' },
     rotationSmoothness: { value: 14, min: 1, max: 30, step: 1, label: 'Плавность поворота' }
+  })
+  const rope = useControls('Верёвка', {
+    segmentLength: { value: ROPE_DEFAULTS.segmentLength, min: 0.3, max: 2, step: 0.05, label: 'Длина звена (*)' },
+    anchorHeight: { value: ROPE_DEFAULTS.anchorHeight, min: 1, max: 8, step: 0.1, label: 'Высота крепления (*)' },
+    cardDensity: { value: ROPE_DEFAULTS.cardDensity, min: 0.1, max: 10, step: 0.1, label: 'Плотность бейджа (*)' },
+    gravity: { value: ROPE_DEFAULTS.gravity, min: 1, max: 100, step: 1, label: 'Гравитация' },
+    timeStep: { value: ROPE_DEFAULTS.timeStep, options: { '60 Гц': 60, '120 Гц': 120, '240 Гц': 240 }, label: 'Шаг физики' },
+    linearDamping: { value: ROPE_DEFAULTS.linearDamping, min: 0, max: 10, step: 0.1, label: 'Затухание движения' },
+    angularDamping: { value: ROPE_DEFAULTS.angularDamping, min: 0, max: 10, step: 0.1, label: 'Затухание вращения' },
+    'Защита от улёта': folder({
+      maxStretch: { value: ROPE_DEFAULTS.maxStretch, min: 0.5, max: 2, step: 0.05, label: 'Макс. оттяжка (× длины)' },
+      maxLinVel: { value: ROPE_DEFAULTS.maxLinVel, min: 2, max: 100, step: 1, label: 'Лимит скорости' },
+      maxAngVel: { value: ROPE_DEFAULTS.maxAngVel, min: 1, max: 60, step: 1, label: 'Лимит вращения' },
+      throwPower: { value: ROPE_DEFAULTS.throwPower, min: 0, max: 1.5, step: 0.05, label: 'Сила броска' },
+      dragSmoothing: { value: ROPE_DEFAULTS.dragSmoothing, min: 2, max: 60, step: 1, label: 'Следование за курсором' },
+      tiltBack: { value: ROPE_DEFAULTS.tiltBack, min: 0, max: 2, step: 0.05, label: 'Возврат лицом к экрану' }
+    }),
+    'Вид ленты': folder({
+      bandWidth: { value: ROPE_DEFAULTS.bandWidth, min: 0.2, max: 3, step: 0.05, label: 'Ширина ленты' },
+      visualMinSpeed: { value: ROPE_DEFAULTS.visualMinSpeed, min: 1, max: 60, step: 1, label: 'Сглаживание мин.' },
+      visualMaxSpeed: { value: ROPE_DEFAULTS.visualMaxSpeed, min: 1, max: 120, step: 1, label: 'Сглаживание макс.' }
+    })
   })
   const lighting = useControls('Свет', {
     ambient: { value: 0, min: 0, max: 8, step: 0.05, label: 'Общий свет' },
@@ -141,6 +185,65 @@ export default function App() {
     grooveScale: { value: 230, min: 20, max: 600, step: 1, label: 'Масштаб следов' },
     circularGrooves: { value: true, label: 'Круговые следы' }
   })
+  const setToonRef = useRef(null)
+  const initialPreset = getInitialPreset()
+  const init = TOON_PRESETS[initialPreset]
+  const [toon, setToon] = useControls('Тун-шейдер', () => ({
+    preset: {
+      value: initialPreset,
+      options: Object.keys(TOON_PRESETS),
+      label: 'Пресет',
+      onChange: (name, _path, context) => {
+        if (context?.initial) return
+        const values = TOON_PRESETS[name]
+        if (values && setToonRef.current) setToonRef.current(values)
+      },
+      transient: false
+    },
+    mode: { value: init.mode, options: MATERIAL_MODES, label: 'Материал' },
+    'Тени (Toon)': folder({
+      toonSteps: { value: init.toonSteps, min: 2, max: 6, step: 1, label: 'Кол-во тонов' },
+      shadowLevel: { value: init.shadowLevel, min: 0, max: 1, step: 0.01, label: 'Яркость тени' }
+    }, { collapsed: true }),
+    'Тени (MToon)': folder({
+      toony: { value: init.toony, min: 0, max: 1, step: 0.01, label: 'Жёсткость границы' },
+      shadingShift: { value: init.shadingShift, min: -1, max: 1, step: 0.01, label: 'Сдвиг тени' },
+      shadeDarkness: { value: init.shadeDarkness, min: 0, max: 1, step: 0.01, label: 'Темнота тени' },
+      shadeTint: { value: init.shadeTint, label: 'Оттенок тени' },
+      rimColor: { value: init.rimColor, label: 'Цвет rim' },
+      rimStrength: { value: init.rimStrength, min: 0, max: 3, step: 0.05, label: 'Сила rim' },
+      rimPower: { value: init.rimPower, min: 0.5, max: 15, step: 0.1, label: 'Узость rim' },
+      rimLift: { value: init.rimLift, min: 0, max: 0.5, step: 0.01, label: 'Подъём rim' }
+    }, { collapsed: true }),
+    'Цвет и свет': folder({
+      metalColor: { value: init.metalColor, label: 'Цвет металла' },
+      saturateMaterials: { value: init.saturateMaterials, min: 0, max: 2, step: 0.05, label: 'Насыщ. материалов' },
+      keyLight: { value: init.keyLight, min: 0, max: 8, step: 0.05, label: 'Ключевой свет' },
+      keyAzimuth: { value: init.keyAzimuth, min: -180, max: 180, step: 1, label: 'Азимут света' },
+      keyElevation: { value: init.keyElevation, min: -89, max: 89, step: 1, label: 'Высота света' },
+      fillLight: { value: init.fillLight, min: 0, max: 4, step: 0.05, label: 'Заполняющий свет' },
+      background: { value: init.background, label: 'Фон (#000 = окружение)' }
+    }, { collapsed: true }),
+    'Обводка': folder({
+      outline: { value: init.outline, label: 'Включить' },
+      outlineThickness: { value: init.outlineThickness, min: 0.5, max: 12, step: 0.1, label: 'Толщина, px' },
+      outlineColor: { value: init.outlineColor, label: 'Цвет' },
+      outlineAngle: { value: init.outlineAngle, min: 0, max: 180, step: 1, label: 'Сглаж. нормалей, °' }
+    }, { collapsed: true }),
+    'Пост-эффекты': folder({
+      saturation: { value: init.saturation, min: -1, max: 1, step: 0.01, label: 'Насыщенность' },
+      contrast: { value: init.contrast, min: -1, max: 1, step: 0.01, label: 'Контраст' },
+      brightness: { value: init.brightness, min: -1, max: 1, step: 0.01, label: 'Яркость' },
+      posterize: { value: init.posterize, label: 'Постеризация' },
+      posterizeBits: { value: init.posterizeBits, min: 3, max: 24, step: 1, label: 'Бит цвета' },
+      halftone: { value: init.halftone, label: 'Халфтон (комикс)' },
+      halftoneScale: { value: init.halftoneScale, min: 0.3, max: 4, step: 0.05, label: 'Размер точки' },
+      halftoneAngle: { value: init.halftoneAngle, min: 0, max: 180, step: 1, label: 'Угол растра' },
+      halftoneOpacity: { value: init.halftoneOpacity, min: 0, max: 1, step: 0.01, label: 'Сила растра' },
+      toonBloom: { value: init.toonBloom, min: 0, max: 3, step: 0.05, label: 'Доп. сияние' }
+    }, { collapsed: true })
+  }))
+  setToonRef.current = setToon
   useEffect(() => {
     brushedUniforms.grooveScale.value = metal.grooveScale
     brushedUniforms.grooveStrength.value = metal.grooveStrength
@@ -151,16 +254,32 @@ export default function App() {
       material.anisotropy = metal.anisotropy
     })
   }, [metal])
+  const keyLightPosition = useMemo(() => {
+    const az = THREE.MathUtils.degToRad(toon.keyAzimuth)
+    const el = THREE.MathUtils.degToRad(toon.keyElevation)
+    return [Math.sin(az) * Math.cos(el) * 10, Math.sin(el) * 10, Math.cos(az) * Math.cos(el) * 10]
+  }, [toon.keyAzimuth, toon.keyElevation])
+  const flatBackground = toon.background.toLowerCase() !== '#000000'
+  const physicsKey = `${modelUrl}|${rope.segmentLength}|${rope.anchorHeight}|${rope.cardDensity}`
+  const bloomIntensity = lighting.bloom + toon.toonBloom
+  const bloomThreshold = toon.toonBloom > 0 ? Math.max(lighting.bloomThreshold, 0.55) : lighting.bloomThreshold
   return (
+    <>
+    {/* Панель в своём контейнере со скроллом: при большом числе пунктов она не уходит за экран */}
+    <div className="leva-scroll">
+      <Leva fill theme={{ sizes: { rootWidth: '380px', controlWidth: '150px' } }} />
+    </div>
     <Canvas camera={{ position: [0, 0, 13], fov: 25 }}>
       <RendererSettings exposure={lighting.exposure} />
-      <ambientLight intensity={lighting.ambient} />
-      {modelUrl && (physics.staticPreview ? <StaticAssembly key={modelUrl} modelUrl={modelUrl} /> : (
-        <Physics key={modelUrl} debug={physics.debug} interpolate gravity={[0, -40, 0]} timeStep={1 / 120}>
-          <Band modelUrl={modelUrl} maxRotationDegrees={physics.maxDragRotation} rotationSmoothness={physics.rotationSmoothness} />
+      <FlatBackground enabled={flatBackground} color={toon.background} />
+      <ambientLight intensity={lighting.ambient + toon.fillLight} />
+      <directionalLight position={keyLightPosition} intensity={toon.keyLight} />
+      {modelUrl && (physics.staticPreview ? <StaticAssembly key={modelUrl} modelUrl={modelUrl} toon={toon} /> : (
+        <Physics key={physicsKey} debug={physics.debug} interpolate gravity={[0, -rope.gravity, 0]} timeStep={1 / rope.timeStep}>
+          <Band modelUrl={modelUrl} rope={rope} toon={toon} maxRotationDegrees={physics.maxDragRotation} rotationSmoothness={physics.rotationSmoothness} />
         </Physics>
       ))}
-      <Environment background blur={0.75}>
+      <Environment background={!flatBackground} blur={0.75}>
         <color attach="background" args={['black']} />
         <Lightformer intensity={lighting.lowerLight} color="white" position={[0, -1, 5]} rotation={[0, 0, Math.PI / 3]} scale={[100, 0.1, 1]} />
         <Lightformer intensity={lighting.leftLight} color="white" position={[-1, -1, 1]} rotation={[0, 0, Math.PI / 3]} scale={[100, 0.1, 1]} />
@@ -168,10 +287,30 @@ export default function App() {
         <Lightformer intensity={lighting.rimLight} color="white" position={[-10, 0, 14]} rotation={[0, Math.PI / 2, Math.PI / 3]} scale={[100, 10, 1]} />
       </Environment>
       <EffectComposer multisampling={0}>
-        <Bloom intensity={lighting.bloom} luminanceThreshold={lighting.bloomThreshold} luminanceSmoothing={0.9} mipmapBlur radius={lighting.bloomRadius} />
+        <Bloom intensity={bloomIntensity} luminanceThreshold={bloomThreshold} luminanceSmoothing={0.9} mipmapBlur radius={lighting.bloomRadius} />
+        {toon.posterize && <ColorDepth bits={toon.posterizeBits} />}
+        {toon.halftone && (
+          <DotScreen angle={THREE.MathUtils.degToRad(toon.halftoneAngle)} scale={toon.halftoneScale} blendFunction={BLEND_OVERLAY} opacity={toon.halftoneOpacity} />
+        )}
+        <HueSaturation saturation={toon.saturation} />
+        <BrightnessContrast brightness={toon.brightness} contrast={toon.contrast} />
       </EffectComposer>
     </Canvas>
+    </>
   )
+}
+// BlendFunction.OVERLAY из pmndrs/postprocessing (сам пакет напрямую не импортируется,
+// он вложен в @react-three/postprocessing).
+const BLEND_OVERLAY = 24
+function FlatBackground({ enabled, color }) {
+  const scene = useThree((state) => state.scene)
+  const colorObject = useMemo(() => new THREE.Color(), [])
+  useFrame(() => {
+    if (!enabled) return
+    colorObject.set(color)
+    if (scene.background !== colorObject) scene.background = colorObject
+  })
+  return null
 }
 function RendererSettings({ exposure }) {
   const gl = useThree((state) => state.gl)
@@ -181,27 +320,64 @@ function RendererSettings({ exposure }) {
   }, [gl, exposure])
   return null
 }
-function StaticAssembly({ modelUrl }) {
+// Обводка через готовый <Outlines> из drei: порталим его внутрь каждого меша модели.
+function ModelOutlines({ root, toon }) {
+  const meshes = useMemo(() => {
+    const list = []
+    root.traverse((object) => object.isMesh && list.push(object))
+    return list
+  }, [root])
+  if (!toon.outline) return null
+  return meshes.map((mesh) => (
+    <Fragment key={mesh.uuid}>
+      {createPortal(
+      <Outlines
+        screenspace
+        thickness={toon.outlineThickness}
+        color={toon.outlineColor}
+        angle={THREE.MathUtils.degToRad(toon.outlineAngle)}
+        toneMapped={false}
+      />,
+      mesh
+      )}
+    </Fragment>
+  ))
+}
+function useToonMaterials(root, toon) {
+  useEffect(() => {
+    applyToonMaterials(root, toon)
+  }, [root, toon])
+}
+function StaticAssembly({ modelUrl, toon }) {
   const { scene } = useGLTF(modelUrl)
   const model = useMemo(() => scene.clone(true), [scene])
+  useToonMaterials(model, toon)
   return (
     <group position={[0, 0, 0]} scale={MODEL_SCALE}>
       <primitive object={model} />
+      <ModelOutlines root={model} toon={toon} />
     </group>
   )
 }
-function Band({ modelUrl, maxSpeed = 50, minSpeed = 10, maxRotationDegrees = 90, rotationSmoothness = 14 }) {
+function clampVelocity(body, max, target = body.linvel()) {
+  const len = Math.hypot(target.x, target.y, target.z)
+  if (len > max) {
+    const k = max / len
+    return { x: target.x * k, y: target.y * k, z: target.z * k }
+  }
+  return null
+}
+function Band({ modelUrl, rope, toon, maxRotationDegrees = 90, rotationSmoothness = 14 }) {
   const band = useRef(), fixed = useRef(), j1 = useRef(), j2 = useRef(), j3 = useRef(), card = useRef(), badge = useRef(), badgePivot = useRef(), animationOpen = useRef(false), dragStart = useRef(null) // prettier-ignore
-  const vec = new THREE.Vector3(), ang = new THREE.Vector3(), rot = new THREE.Vector3(), dir = new THREE.Vector3() // prettier-ignore
-  const segmentProps = { type: 'dynamic', canSleep: true, colliders: false, angularDamping: 2, linearDamping: 1.5 }
+  const dragTarget = useRef(null), dragVelocity = useRef(new THREE.Vector3()), wasDragged = useRef(false) // prettier-ignore
+  const vec = new THREE.Vector3(), ang = new THREE.Vector3(), rot = new THREE.Vector3(), dir = new THREE.Vector3(), prev = new THREE.Vector3() // prettier-ignore
+  const segLen = rope.segmentLength
+  const CARD_JOINT_Y = 1.45
+  const segmentProps = { type: 'dynamic', canSleep: true, colliders: false, angularDamping: rope.angularDamping, linearDamping: rope.linearDamping }
   const { scene, animations } = useGLTF(modelUrl)
   const texture = useTexture('/textures/band.jpg')
   const badgeModel = useMemo(() => scene.clone(true), [scene])
-  // Художник в Blender ставит пустышку (Empty) туда, где физически находится
-  // петля/дырка на бейдже для ремешка. Ищем такую пустышку среди
-  // верхнеуровневых объектов модели и используем её как точку крепления —
-  // тогда ремешок всегда попадает точно в петлю, а не "залезает" на корпус.
-  // Если пустышки в модели нет — используем старые захардкоженные числа.
+  useToonMaterials(badgeModel, toon)
   // Ремешок должен входить в бейдж СВЕРХУ ПО ЦЕНТРУ. Берём габариты модели и
   // считаем точку "верх, центр по X/Z" — её и совмещаем с концом верёвки.
   // ATTACH_INSET чуть утапливает кончик ленты внутрь корпуса, чтобы он не торчал.
@@ -217,10 +393,10 @@ function Band({ modelUrl, maxSpeed = 50, minSpeed = 10, maxRotationDegrees = 90,
   const [curve] = useState(() => new THREE.CatmullRomCurve3([new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()]))
   const [dragged, drag] = useState(false)
   const [hovered, hover] = useState(false)
-  useRopeJoint(fixed, j1, [[0, 0, 0], [0, 0, 0], 1]) // prettier-ignore
-  useRopeJoint(j1, j2, [[0, 0, 0], [0, 0, 0], 1]) // prettier-ignore
-  useRopeJoint(j2, j3, [[0, 0, 0], [0, 0, 0], 1]) // prettier-ignore
-  useSphericalJoint(j3, card, [[0, 0, 0], [0, 1.45, 0]]) // prettier-ignore
+  useRopeJoint(fixed, j1, [[0, 0, 0], [0, 0, 0], segLen]) // prettier-ignore
+  useRopeJoint(j1, j2, [[0, 0, 0], [0, 0, 0], segLen]) // prettier-ignore
+  useRopeJoint(j2, j3, [[0, 0, 0], [0, 0, 0], segLen]) // prettier-ignore
+  useSphericalJoint(j3, card, [[0, 0, 0], [0, CARD_JOINT_Y, 0]]) // prettier-ignore
   useEffect(() => {
     if (hovered) {
       document.body.style.cursor = dragged ? 'grabbing' : 'grab'
@@ -242,12 +418,49 @@ function Band({ modelUrl, maxSpeed = 50, minSpeed = 10, maxRotationDegrees = 90,
     })
   }
   useFrame((state, delta) => {
-    if (dragged) {
+    const dt = Math.min(delta, 1 / 20)
+    if (dragged && card.current) {
       vec.set(state.pointer.x, state.pointer.y, 0.5).unproject(state.camera)
       dir.copy(vec).sub(state.camera.position).normalize()
       vec.add(dir.multiplyScalar(state.camera.position.length()))
+      vec.sub(dragged)
+      // ЗАЩИТА №1: не даём утащить бейдж дальше, чем позволяет верёвка. Раньше
+      // курсор уводил кинематический бейдж на любое расстояние, суставы Rapier
+      // растягивались, и при отпускании пружина выстреливала бейдж в космос.
+      const anchor = fixed.current.translation()
+      const maxReach = (segLen * 3 + CARD_JOINT_Y) * rope.maxStretch
+      dir.set(vec.x - anchor.x, vec.y - anchor.y, vec.z - anchor.z)
+      if (dir.length() > maxReach) vec.set(anchor.x, anchor.y, anchor.z).add(dir.setLength(maxReach))
+      // Плавное следование за курсором вместо телепорта — меньше рывков.
+      if (!dragTarget.current) dragTarget.current = new THREE.Vector3().copy(card.current.translation())
+      prev.copy(dragTarget.current)
+      dragTarget.current.lerp(vec, 1 - Math.exp(-rope.dragSmoothing * dt))
+      // Скорость, с которой «бросаем» бейдж в момент отпускания.
+      if (dt > 0) dragVelocity.current.lerp(prev.subVectors(dragTarget.current, prev).divideScalar(dt), 0.3)
       ;[card, j1, j2, j3, fixed].forEach((ref) => ref.current?.wakeUp())
-      card.current?.setNextKinematicTranslation({ x: vec.x - dragged.x, y: vec.y - dragged.y, z: vec.z - dragged.z })
+      card.current.setNextKinematicTranslation(dragTarget.current)
+      wasDragged.current = true
+    } else if (wasDragged.current && card.current) {
+      // ЗАЩИТА №2: при отпускании задаём контролируемую скорость броска
+      // (с множителем и лимитом), а не ту, что насчитал решатель.
+      wasDragged.current = false
+      dragTarget.current = null
+      const v = dragVelocity.current.multiplyScalar(rope.throwPower)
+      card.current.setLinvel(clampVelocity(card.current, rope.maxLinVel, v) ?? v, true)
+      card.current.setAngvel({ x: 0, y: 0, z: 0 }, true)
+      ;[j1, j2, j3].forEach((ref) => ref.current?.setLinvel({ x: 0, y: 0, z: 0 }, true))
+      dragVelocity.current.set(0, 0, 0)
+    }
+    // ЗАЩИТА №3: жёсткий лимит скоростей для всех тел верёвки каждый кадр.
+    if (!dragged) {
+      ;[card, j1, j2, j3].forEach((ref) => {
+        const body = ref.current
+        if (!body) return
+        const lin = clampVelocity(body, rope.maxLinVel)
+        if (lin) body.setLinvel(lin, true)
+        const angClamped = clampVelocity(body, rope.maxAngVel, body.angvel())
+        if (angClamped) body.setAngvel(angClamped, true)
+      })
     }
     // The rope joint owns the rigid body rotation, so the interaction tilt belongs on
     // the visual group. This keeps it responsive while preserving the physics chain.
@@ -267,7 +480,7 @@ function Band({ modelUrl, maxSpeed = 50, minSpeed = 10, maxRotationDegrees = 90,
       ;[j1, j2].forEach((ref) => {
         if (!ref.current.lerped) ref.current.lerped = new THREE.Vector3().copy(ref.current.translation())
         const clampedDistance = Math.max(0.1, Math.min(1, ref.current.lerped.distanceTo(ref.current.translation())))
-        ref.current.lerped.lerp(ref.current.translation(), delta * (minSpeed + clampedDistance * (maxSpeed - minSpeed)))
+        ref.current.lerped.lerp(ref.current.translation(), Math.min(1, dt * (rope.visualMinSpeed + clampedDistance * (rope.visualMaxSpeed - rope.visualMinSpeed))))
       })
       // Calculate catmul curve
       curve.points[0].copy(j3.current.translation())
@@ -279,7 +492,7 @@ function Band({ modelUrl, maxSpeed = 50, minSpeed = 10, maxRotationDegrees = 90,
       if (!dragged) {
         ang.copy(card.current.angvel())
         rot.copy(card.current.rotation())
-        card.current.setAngvel({ x: ang.x, y: ang.y - rot.y * 0.25, z: ang.z })
+        card.current.setAngvel({ x: ang.x, y: ang.y - rot.y * rope.tiltBack, z: ang.z })
       }
     }
   })
@@ -287,20 +500,20 @@ function Band({ modelUrl, maxSpeed = 50, minSpeed = 10, maxRotationDegrees = 90,
   texture.wrapS = texture.wrapT = THREE.RepeatWrapping
   return (
     <>
-      <group position={[0, 4, 0]}>
+      <group position={[0, rope.anchorHeight, 0]}>
         <RigidBody ref={fixed} {...segmentProps} type="fixed" />
-        <RigidBody position={[0.5, 0, 0]} ref={j1} {...segmentProps}>
+        <RigidBody position={[segLen * 0.5, 0, 0]} ref={j1} {...segmentProps}>
           <BallCollider args={[0.1]} />
         </RigidBody>
-        <RigidBody position={[1, 0, 0]} ref={j2} {...segmentProps}>
+        <RigidBody position={[segLen, 0, 0]} ref={j2} {...segmentProps}>
           <BallCollider args={[0.1]} />
         </RigidBody>
-        <RigidBody position={[1.5, 0, 0]} ref={j3} {...segmentProps}>
+        <RigidBody position={[segLen * 1.5, 0, 0]} ref={j3} {...segmentProps}>
           <BallCollider args={[0.1]} />
         </RigidBody>
-        <RigidBody position={[2, 0, 0]} ref={card} {...segmentProps} type={dragged ? 'kinematicPosition' : 'dynamic'}>
-          <CuboidCollider args={[0.8, 1.125, 0.01]} />
-          <group ref={badgePivot} position={[0, 1.45, 0]}>
+        <RigidBody position={[segLen * 2, 0, 0]} ref={card} {...segmentProps} type={dragged ? 'kinematicPosition' : 'dynamic'}>
+          <CuboidCollider args={[0.8, 1.125, 0.01]} density={rope.cardDensity} />
+          <group ref={badgePivot} position={[0, CARD_JOINT_Y, 0]}>
             <group
               ref={badge}
               scale={MODEL_SCALE}
@@ -322,13 +535,14 @@ function Band({ modelUrl, maxSpeed = 50, minSpeed = 10, maxRotationDegrees = 90,
                 drag(new THREE.Vector3().copy(e.point).sub(vec.copy(card.current.translation())))
               }}>
               <primitive object={badgeModel} />
+              <ModelOutlines root={badgeModel} toon={toon} />
             </group>
           </group>
         </RigidBody>
       </group>
       <mesh ref={band}>
         <meshLineGeometry />
-        <meshLineMaterial color="white" resolution={[width, height]} useMap map={texture} repeat={[-3, 1]} lineWidth={1} />
+        <meshLineMaterial color="white" resolution={[width, height]} useMap map={texture} repeat={[-3, 1]} lineWidth={rope.bandWidth} />
       </mesh>
     </>
   )

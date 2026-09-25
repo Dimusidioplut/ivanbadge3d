@@ -12,3 +12,15 @@ body,
 body {
   background-color: #111;
 }
+.leva-scroll {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  width: 380px;
+  max-width: calc(100vw - 20px);
+  max-height: calc(100vh - 20px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  z-index: 1000;
+  border-radius: 10px;
+}

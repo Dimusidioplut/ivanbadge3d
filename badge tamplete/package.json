@@ -4,6 +4,7 @@
     "build": "node scripts/model-manifest.cjs && react-scripts build"
   },
   "dependencies": {
+    "@pixiv/three-vrm-materials-mtoon": "2.1.0",
     "@react-three/drei": "9.96.4",
     "@react-three/fiber": "8.15.15",
     "@react-three/postprocessing": "^2.16.0",

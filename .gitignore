@@ -14,3 +14,4 @@ _claude_scratch/
 *.egg-info/
 dist/
 build/
+node_modules/
