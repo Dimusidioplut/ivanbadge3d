@@ -1,0 +1,6 @@
+{
+  "framework": null,
+  "installCommand": "cd \"badge tamplete\" && npm ci",
+  "buildCommand": "cd \"badge tamplete\" && CI=false npm run build",
+  "outputDirectory": "badge tamplete/build"
+}
